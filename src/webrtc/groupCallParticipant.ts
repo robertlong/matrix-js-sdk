@@ -10,14 +10,15 @@ export enum GroupCallParticipantEvent {
     VolumeChanged = "volume_changed",
     MuteStateChanged = "mute_state_changed",
     Datachannel = "datachannel",
-    CallReplaced = "call_replaced"
+    CallReplaced = "call_replaced",
+    CallFeedsChanged = "call_feeds_changed"
 }
 
 export class GroupCallParticipant extends EventEmitter {
-    public feeds: CallFeed[] = [];
-    public activeSpeaker: boolean;
     public activeSpeakerSamples: number[];
     public dataChannel?: RTCDataChannel;
+    private initializedUsermediaFeed?: CallFeed;
+    private localUsermediaFeed?: CallFeed;
 
     constructor(
         private groupCall: GroupCall,
@@ -38,43 +39,36 @@ export class GroupCallParticipant extends EventEmitter {
             this.call.on(CallEvent.FeedsChanged, this.onCallFeedsChanged);
             this.call.on(CallEvent.Replaced, this.onCallReplaced);
             this.call.on(CallEvent.Hangup, this.onCallHangup);
+            this.call.on(CallEvent.DataChannel, this.onCallDataChannel);
+
+            const usermediaFeed = this.usermediaFeed;
+
+            if (usermediaFeed) {
+                this.initUserMediaFeed(usermediaFeed);
+            }
         }
     }
 
-    public replaceCall(call: MatrixCall, sessionId: string) {
-        const oldCall = this.call;
+    public setLocalUsermediaFeed(callFeed: CallFeed) {
+        this.localUsermediaFeed = callFeed;
+        this.initUserMediaFeed(callFeed);
+    }
 
+    public get feeds(): CallFeed[] {
         if (this.call) {
-            this.call.hangup(CallErrorCode.Replaced, false);
-            this.call.removeListener(CallEvent.State, this.onCallStateChanged);
-            this.call.removeListener(
-                CallEvent.FeedsChanged,
-                this.onCallFeedsChanged,
-            );
-            this.call.removeListener(CallEvent.Replaced, this.onCallReplaced);
-            this.call.removeListener(CallEvent.Hangup, this.onCallHangup);
-            this.call.removeListener(CallEvent.DataChannel, this.onCallDataChannel);
+            return this.call.getRemoteFeeds();
+        } else if (this.localUsermediaFeed) {
+            return [this.localUsermediaFeed];
         }
 
-        this.call = call;
-        this.member = call.getOpponentMember();
-        this.activeSpeaker = false;
-        this.sessionId = sessionId;
-
-        this.call.on(CallEvent.State, this.onCallStateChanged);
-        this.call.on(CallEvent.FeedsChanged, this.onCallFeedsChanged);
-        this.call.on(CallEvent.Replaced, this.onCallReplaced);
-        this.call.on(CallEvent.Hangup, this.onCallHangup);
-        this.call.on(CallEvent.DataChannel, this.onCallDataChannel);
-
-        this.groupCall.emit(GroupCallParticipantEvent.CallReplaced, this, oldCall, call);
+        return [];
     }
 
-    public get usermediaFeed() {
+    public get usermediaFeed(): CallFeed | undefined {
         return this.feeds.find((feed) => feed.purpose === SDPStreamMetadataPurpose.Usermedia);
     }
 
-    public get usermediaStream(): MediaStream {
+    public get usermediaStream(): MediaStream | undefined {
         return this.usermediaFeed?.stream;
     }
 
@@ -98,7 +92,39 @@ export class GroupCallParticipant extends EventEmitter {
         return feed.isVideoMuted();
     }
 
-    private onCallStateChanged = (state) => {
+    public isActiveSpeaker(): boolean {
+        return this.groupCall.activeSpeaker === this;
+    }
+
+    public replaceCall(call: MatrixCall, sessionId: string) {
+        const oldCall = this.call;
+
+        if (this.call) {
+            this.call.hangup(CallErrorCode.Replaced, false);
+            this.call.removeListener(CallEvent.State, this.onCallStateChanged);
+            this.call.removeListener(
+                CallEvent.FeedsChanged,
+                this.onCallFeedsChanged,
+            );
+            this.call.removeListener(CallEvent.Replaced, this.onCallReplaced);
+            this.call.removeListener(CallEvent.Hangup, this.onCallHangup);
+            this.call.removeListener(CallEvent.DataChannel, this.onCallDataChannel);
+        }
+
+        this.call = call;
+        this.member = call.getOpponentMember();
+        this.sessionId = sessionId;
+
+        this.call.on(CallEvent.State, this.onCallStateChanged);
+        this.call.on(CallEvent.FeedsChanged, this.onCallFeedsChanged);
+        this.call.on(CallEvent.Replaced, this.onCallReplaced);
+        this.call.on(CallEvent.Hangup, this.onCallHangup);
+        this.call.on(CallEvent.DataChannel, this.onCallDataChannel);
+
+        this.groupCall.emit(GroupCallParticipantEvent.CallReplaced, this, oldCall, call);
+    }
+
+    private onCallStateChanged = () => {
         const call = this.call;
         const audioMuted = this.groupCall.localParticipant.isAudioMuted();
 
@@ -119,27 +145,53 @@ export class GroupCallParticipant extends EventEmitter {
         }
     };
 
-    onCallFeedsChanged = () => {
-        const oldFeeds = this.feeds;
-        const newFeeds = this.call.getRemoteFeeds();
+    private onCallFeedsChanged = () => {
+        const nextUsermediaFeed = this.usermediaFeed;
 
-        this.feeds = [];
-
-        for (const feed of newFeeds) {
-            if (oldFeeds.includes(feed)) {
-                continue;
+        if (nextUsermediaFeed && nextUsermediaFeed !== this.initializedUsermediaFeed) {
+            if (this.initializedUsermediaFeed) {
+                this.initializedUsermediaFeed.removeListener(CallFeedEvent.Speaking, this.onCallFeedSpeaking);
+                this.initializedUsermediaFeed.removeListener(
+                    CallFeedEvent.VolumeChanged,
+                    this.onCallFeedVolumeChanged,
+                );
+                this.initializedUsermediaFeed.removeListener(
+                    CallFeedEvent.MuteStateChanged,
+                    this.onCallFeedMuteStateChanged,
+                );
             }
 
-            this.addCallFeed(feed);
+            this.initUserMediaFeed(nextUsermediaFeed);
         }
+
+        this.emit(GroupCallParticipantEvent.CallFeedsChanged);
     };
 
-    onCallReplaced = (newCall) => {
+    private initUserMediaFeed(callFeed: CallFeed) {
+        this.initializedUsermediaFeed = callFeed;
+        callFeed.setSpeakingThreshold(this.groupCall.speakingThreshold);
+        callFeed.measureVolumeActivity(true);
+        callFeed.on(CallFeedEvent.Speaking, this.onCallFeedSpeaking);
+        callFeed.on(
+            CallFeedEvent.VolumeChanged,
+            this.onCallFeedVolumeChanged,
+        );
+        callFeed.on(
+            CallFeedEvent.MuteStateChanged,
+            this.onCallFeedMuteStateChanged,
+        );
+        this.onCallFeedMuteStateChanged(
+            this.isAudioMuted(),
+            this.isVideoMuted(),
+        );
+    }
+
+    private onCallReplaced = (newCall) => {
         // TODO: Should we always reuse the sessionId?
         this.replaceCall(newCall, this.sessionId);
     };
 
-    onCallHangup = () => {
+    private onCallHangup = () => {
         if (this.call.hangupReason === CallErrorCode.Replaced) {
             return;
         }
@@ -157,46 +209,23 @@ export class GroupCallParticipant extends EventEmitter {
             this.groupCall.participants.length > 0
         ) {
             this.groupCall.activeSpeaker = this.groupCall.participants[0];
-            this.groupCall.activeSpeaker.activeSpeaker = true;
             this.groupCall.emit(GroupCallEvent.ActiveSpeakerChanged, this.groupCall.activeSpeaker);
         }
 
         this.groupCall.emit(GroupCallEvent.ParticipantsChanged, this.groupCall.participants);
     };
 
-    addCallFeed(callFeed: CallFeed) {
-        if (callFeed.purpose === SDPStreamMetadataPurpose.Usermedia) {
-            callFeed.setSpeakingThreshold(this.groupCall.speakingThreshold);
-            callFeed.measureVolumeActivity(true);
-            callFeed.on(CallFeedEvent.Speaking, this.onCallFeedSpeaking);
-            callFeed.on(
-                CallFeedEvent.VolumeChanged,
-                this.onCallFeedVolumeChanged,
-            );
-            callFeed.on(
-                CallFeedEvent.MuteStateChanged,
-                this.onCallFeedMuteStateChanged,
-            );
-            this.onCallFeedMuteStateChanged(
-                this.isAudioMuted(),
-                this.isVideoMuted(),
-            );
-        }
-
-        this.feeds.push(callFeed);
-    }
-
-    onCallFeedSpeaking = (speaking: boolean) => {
+    private onCallFeedSpeaking = (speaking: boolean) => {
         this.emit(GroupCallParticipantEvent.Speaking, speaking);
     };
 
-    onCallFeedVolumeChanged = (maxVolume: number) => {
+    private onCallFeedVolumeChanged = (maxVolume: number) => {
         this.activeSpeakerSamples.shift();
         this.activeSpeakerSamples.push(maxVolume);
         this.emit(GroupCallParticipantEvent.VolumeChanged, maxVolume);
     };
 
-    onCallFeedMuteStateChanged = (audioMuted: boolean, videoMuted: boolean) => {
+    private onCallFeedMuteStateChanged = (audioMuted: boolean, videoMuted: boolean) => {
         if (audioMuted) {
             this.activeSpeakerSamples = Array(this.groupCall.activeSpeakerSampleCount).fill(
                 -Infinity,
@@ -206,7 +235,7 @@ export class GroupCallParticipant extends EventEmitter {
         this.emit(GroupCallParticipantEvent.MuteStateChanged, audioMuted, videoMuted);
     };
 
-    onCallDataChannel = (dataChannel: RTCDataChannel) => {
+    private onCallDataChannel = (dataChannel: RTCDataChannel) => {
         this.dataChannel = dataChannel;
         this.emit(GroupCallParticipantEvent.Datachannel, dataChannel);
     };

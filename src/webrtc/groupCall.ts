@@ -4,12 +4,12 @@ import { MatrixClient } from "../client";
 import { randomString } from "../randomstring";
 import { CallErrorCode, CallState, CallType, MatrixCall } from "./call";
 import { RoomMember } from "../models/room-member";
-import { SDPStreamMetadataPurpose } from "./callEventTypes";
 import { Room } from "../models/room";
 import { logger } from "../logger";
 import { Callback } from "../client";
 import { ReEmitter } from "../ReEmitter";
 import { GroupCallParticipant, GroupCallParticipantEvent } from "./groupCallParticipant";
+import { SDPStreamMetadataPurpose } from "./callEventTypes";
 
 export enum GroupCallEvent {
     Entered = "entered",
@@ -51,24 +51,20 @@ export class GroupCall extends EventEmitter {
         this.reEmitter = new ReEmitter(this);
     }
 
-    async initLocalParticipant() {
+    public async initLocalParticipant() {
         if (this.localParticipant) {
             return this.localParticipant;
         }
 
-        let stream;
-
-        if (this.type === CallType.Video) {
-            stream = await this.client.getLocalVideoStream();
-        } else {
-            stream = await this.client.getLocalAudioStream();
-        }
+        const stream = await this.client.getMediaHandler().getUserMediaStream(true, this.type === CallType.Video);
 
         const userId = this.client.getUserId();
 
-        const localCallFeed = new CallFeed(
+        const member = this.room.getMember(userId);
+
+        const callFeed = new CallFeed(
             stream,
-            userId,
+            member.userId,
             SDPStreamMetadataPurpose.Usermedia,
             this.client,
             this.room.roomId,
@@ -76,19 +72,18 @@ export class GroupCall extends EventEmitter {
             false,
         );
 
-        const member = this.room.getMember(userId);
-
         this.localParticipant = new GroupCallParticipant(
             this,
             member,
             randomString(16),
         );
-        this.localParticipant.addCallFeed(localCallFeed);
+
+        this.localParticipant.setLocalUsermediaFeed(callFeed);
 
         return this.localParticipant;
     }
 
-    async enter() {
+    public async enter() {
         if (!this.localParticipant) {
             await this.initLocalParticipant();
         }
@@ -134,9 +129,9 @@ export class GroupCall extends EventEmitter {
         this.onActiveSpeakerLoop();
     }
 
-    leave() {
+    public leave() {
         this.localParticipant = null;
-        this.client.stopLocalMediaStream();
+        this.client.getMediaHandler().stopAllStreams();
 
         if (!this.entered) {
             return;
@@ -180,7 +175,7 @@ export class GroupCall extends EventEmitter {
         this.emit(GroupCallEvent.Left);
     }
 
-    isLocalVideoMuted() {
+    public isLocalVideoMuted() {
         if (this.localParticipant) {
             return this.localParticipant.isVideoMuted();
         }
@@ -188,7 +183,7 @@ export class GroupCall extends EventEmitter {
         return true;
     }
 
-    isMicrophoneMuted() {
+    public isMicrophoneMuted() {
         if (this.localParticipant) {
             return this.localParticipant.isAudioMuted();
         }
@@ -196,8 +191,14 @@ export class GroupCall extends EventEmitter {
         return true;
     }
 
-    setMicrophoneMuted(muted) {
+    public setMicrophoneMuted(muted) {
         if (this.localParticipant) {
+            const usermediaFeed = this.localParticipant.usermediaFeed;
+
+            if (usermediaFeed) {
+                usermediaFeed.setAudioMuted(muted);
+            }
+
             for (const { stream } of this.localParticipant.feeds) {
                 for (const track of stream.getTracks()) {
                     if (track.kind === "audio") {
@@ -220,8 +221,14 @@ export class GroupCall extends EventEmitter {
         this.emit(GroupCallEvent.LocalMuteStateChanged, muted, this.isLocalVideoMuted());
     }
 
-    setLocalVideoMuted(muted) {
+    public setLocalVideoMuted(muted) {
         if (this.localParticipant) {
+            const usermediaFeed = this.localParticipant.usermediaFeed;
+
+            if (usermediaFeed) {
+                usermediaFeed.setVideoMuted(muted);
+            }
+
             for (const { stream } of this.localParticipant.feeds) {
                 for (const track of stream.getTracks()) {
                     if (track.kind === "video") {
@@ -256,7 +263,7 @@ export class GroupCall extends EventEmitter {
      * Call presence
      */
 
-    onPresenceLoop = () => {
+    private onPresenceLoop = () => {
         const userId = this.client.getUserId();
         const currentMemberState = this.room.currentState.getStateEvents(
             "m.room.member",
@@ -320,7 +327,7 @@ export class GroupCall extends EventEmitter {
      *    as they are observed by the RoomState.members event.
      */
 
-    processInitialCalls() {
+    private processInitialCalls() {
         const calls = this.client.callEventHandler.calls.values();
 
         for (const call of calls) {
@@ -328,7 +335,7 @@ export class GroupCall extends EventEmitter {
         }
     }
 
-    onIncomingCall = (call: MatrixCall) => {
+    private onIncomingCall = (call: MatrixCall) => {
         // The incoming calls may be for another room, which we will ignore.
         if (call.roomId !== this.room.roomId) {
             return;
@@ -383,7 +390,7 @@ export class GroupCall extends EventEmitter {
         }
     };
 
-    onRoomStateMembers = (_event, _state, member: RoomMember) => {
+    private onRoomStateMembers = (_event, _state, member: RoomMember) => {
         // The member events may be received for another room, which we will ignore.
         if (member.roomId !== this.room.roomId) {
             return;
@@ -393,7 +400,7 @@ export class GroupCall extends EventEmitter {
         this.onMemberChanged(member);
     };
 
-    onMemberChanged = (member: RoomMember) => {
+    private onMemberChanged = (member: RoomMember) => {
         // Don't process your own member.
         const localUserId = this.client.getUserId();
 
@@ -483,7 +490,7 @@ export class GroupCall extends EventEmitter {
         }
     };
 
-    onActiveSpeakerLoop = () => {
+    private onActiveSpeakerLoop = () => {
         let topAvg;
         let nextActiveSpeaker;
 
@@ -499,17 +506,13 @@ export class GroupCall extends EventEmitter {
 
             if (!topAvg || avg > topAvg) {
                 topAvg = avg;
-                nextActiveSpeaker = participant.member;
+                nextActiveSpeaker = participant;
             }
         }
 
-        if (nextActiveSpeaker && topAvg > this.speakingThreshold) {
-            if (nextActiveSpeaker && this.activeSpeaker !== nextActiveSpeaker) {
-                this.activeSpeaker.activeSpeaker = false;
-                nextActiveSpeaker.activeSpeaker = true;
-                this.activeSpeaker = nextActiveSpeaker;
-                this.emit(GroupCallEvent.ActiveSpeakerChanged, this.activeSpeaker);
-            }
+        if (nextActiveSpeaker && this.activeSpeaker !== nextActiveSpeaker && topAvg > this.speakingThreshold) {
+            this.activeSpeaker = nextActiveSpeaker;
+            this.emit(GroupCallEvent.ActiveSpeakerChanged, this.activeSpeaker);
         }
 
         this.activeSpeakerLoopTimeout = setTimeout(
@@ -523,7 +526,7 @@ export class GroupCall extends EventEmitter {
      */
 
     // TODO: move this elsewhere or get rid of the retry logic. Do we need it?
-    sendStateEventWithRetry(
+    private sendStateEventWithRetry(
         roomId: string,
         eventType: string,
         content: any,
