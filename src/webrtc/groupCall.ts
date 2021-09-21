@@ -348,7 +348,7 @@ export class GroupCall extends EventEmitter {
 
         const opponentMember = call.getOpponentMember();
 
-        logger.log(`GroupCall: incomming call from: ${opponentMember.userId}`);
+        logger.log(`GroupCall: incoming call from: ${opponentMember.userId}`);
 
         const memberStateEvent = this.room.currentState.getStateEvents(
             "m.room.member",
@@ -486,7 +486,7 @@ export class GroupCall extends EventEmitter {
             // a participant without a stream can still listen in on other user's streams?
             this.participants.push(participant);
             this.reEmitter.reEmit(participant, Object.values(GroupCallParticipantEvent));
-            this.emit(GroupCallEvent.ParticipantsChanged), this.participants;
+            this.emit(GroupCallEvent.ParticipantsChanged, this.participants);
         }
     };
 
