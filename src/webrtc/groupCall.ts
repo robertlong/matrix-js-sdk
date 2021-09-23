@@ -19,15 +19,21 @@ export enum GroupCallEvent {
     LocalMuteStateChanged = "local_mute_state_changed",
 }
 
-const CONF_ROOM = "me.robertlong.conf";
+export const CONF_ROOM = "me.robertlong.conf";
 const CONF_PARTICIPANT = "me.robertlong.conf.participant";
+
+export interface IGroupCallDataChannelOptions {
+    ordered: boolean;
+    maxPacketLifeTime: number;
+    maxRetransmits: number;
+    protocol: string;
+}
 
 export class GroupCall extends EventEmitter {
     public entered = false;
     public activeSpeaker: GroupCallParticipant;
     public localParticipant: GroupCallParticipant;
     public participants: GroupCallParticipant[] = [];
-    public room: Room;
     public activeSpeakerSampleCount = 8;
     public activeSpeakerInterval = 1000;
     public speakingThreshold = -80;
@@ -40,14 +46,12 @@ export class GroupCall extends EventEmitter {
 
     constructor(
         private client: MatrixClient,
-        roomId: string,
+        public room: Room,
         public type: CallType,
         private dataChannelsEnabled?: boolean,
-        private dataChannelOptions?: RTCDataChannelInit,
+        private dataChannelOptions?: IGroupCallDataChannelOptions,
     ) {
         super();
-
-        this.room = this.client.getRoom(roomId);
         this.reEmitter = new ReEmitter(this);
     }
 
@@ -86,20 +90,6 @@ export class GroupCall extends EventEmitter {
     public async enter() {
         if (!this.localParticipant) {
             await this.initLocalParticipant();
-        }
-
-        // Ensure that this room is marked as a conference room so clients can react appropriately
-        const activeConf = this.room.currentState
-            .getStateEvents(CONF_ROOM, "")
-            ?.getContent()?.active;
-
-        if (!activeConf) {
-            this.sendStateEventWithRetry(
-                this.room.roomId,
-                CONF_ROOM,
-                { active: true, callType: this.type },
-                "",
-            );
         }
 
         this.activeSpeaker = this.localParticipant;
@@ -183,6 +173,12 @@ export class GroupCall extends EventEmitter {
     }
 
     public async endCall() {
+        this.leave();
+
+        this.client.groupCallEventHandler.groupCalls.delete(this.room.roomId);
+
+        this.client.emit("GroupCall.ended", this);
+
         await this.sendStateEventWithRetry(
             this.room.roomId,
             CONF_ROOM,

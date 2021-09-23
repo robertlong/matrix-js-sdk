@@ -144,8 +144,9 @@ import { IHierarchyRoom, ISpaceSummaryEvent, ISpaceSummaryRoom } from "./@types/
 import { IPusher, IPusherRequest, IPushRules, PushRuleAction, PushRuleKind, RuleId } from "./@types/PushRules";
 import { IThreepid } from "./@types/threepids";
 import { CryptoStore } from "./crypto/store/base";
-import { GroupCall } from "./webrtc/groupCall";
+import { CONF_ROOM, GroupCall, IGroupCallDataChannelOptions } from "./webrtc/groupCall";
 import { MediaHandler } from "./webrtc/mediaHandler";
+import { GroupCallEventHandler } from "./webrtc/groupCallEventHandler";
 
 export type Store = IStore;
 export type SessionStore = WebStorageSessionStore;
@@ -696,6 +697,7 @@ export class MatrixClient extends EventEmitter {
     public crypto: Crypto; // XXX: Intended private, used in code.
     public cryptoCallbacks: ICryptoCallbacks; // XXX: Intended private, used in code.
     public callEventHandler: CallEventHandler; // XXX: Intended private, used in code.
+    public groupCallEventHandler: GroupCallEventHandler;
     public supportsCallTransfer = false; // XXX: Intended private, used in code.
     public forceTURN = false; // XXX: Intended private, used in code.
     public iceCandidatePoolSize = 0; // XXX: Intended private, used in code.
@@ -815,6 +817,7 @@ export class MatrixClient extends EventEmitter {
         const call = createNewMatrixCall(this, undefined, undefined);
         if (call) {
             this.callEventHandler = new CallEventHandler(this);
+            this.groupCallEventHandler = new GroupCallEventHandler(this);
             this.canSupportVoip = true;
             // Start listening for calls after the initial sync is done
             // We do not need to backfill the call event buffer
@@ -1005,6 +1008,7 @@ export class MatrixClient extends EventEmitter {
         this.peekSync?.stopPeeking();
 
         this.callEventHandler?.stop();
+        this.groupCallEventHandler?.stop();
         this.callEventHandler = null;
 
         global.clearInterval(this.checkTurnServersIntervalID);
@@ -1286,18 +1290,54 @@ export class MatrixClient extends EventEmitter {
     }
 
     /**
-     * Creates a new group call.
+     * Creates a new group call and sends the associated state event
+     * to alert other members that the room now has a group call.
      *
      * @param {string} roomId The room the call is to be placed in.
-     * @return {GroupCall} the call or null if the browser doesn't support calling.
+     * @return {GroupCall}
      */
-    public createGroupCall(
+    public async createGroupCall(
         roomId: string,
         type: CallType,
         dataChannelsEnabled?: boolean,
-        dataChannelOptions?: RTCDataChannelInit,
-    ): GroupCall {
-        return new GroupCall(this, roomId, type, dataChannelsEnabled, dataChannelOptions);
+        dataChannelOptions?: IGroupCallDataChannelOptions,
+    ): Promise<GroupCall> {
+        if (this.getGroupCallForRoom(roomId)) {
+            throw new Error(`${roomId} already has an existing group call`);
+        }
+
+        const room = this.getRoom(roomId);
+
+        if (!room) {
+            throw new Error(`Cannot find room ${roomId}`);
+        }
+
+        const groupCall = new GroupCall(this, room, type, dataChannelsEnabled, dataChannelOptions);
+        this.groupCallEventHandler.groupCalls.set(roomId, groupCall);
+
+        const activeConf = room.currentState
+            .getStateEvents(CONF_ROOM, "")
+            ?.getContent()?.active;
+
+        if (!activeConf) {
+            await this.sendStateEvent(
+                room.roomId,
+                CONF_ROOM,
+                { active: true, callType: type, dataChannelsEnabled, dataChannelOptions },
+                "",
+            );
+        }
+
+        return groupCall;
+    }
+
+    /**
+     * Get an existing group call for the provided room.
+     * @param roomId
+     * @returns {GroupCall} The group call or null if it doesn't already exist.
+     */
+    public getGroupCallForRoom(roomId: string): GroupCall | null {
+        return this.groupCallEventHandler.groupCalls.get(roomId) || null;
     }
 
     /**
@@ -4305,7 +4345,16 @@ export class MatrixClient extends EventEmitter {
      * @return {module:http-api.MatrixError} Rejects: with an error response.
      */
     public kick(roomId: string, userId: string, reason?: string, callback?: Callback): Promise<{}> {
-        return this.setMembershipState(roomId, userId, "leave", reason, callback);
+        const path = utils.encodeUri("/rooms/$roomId/kick", {
+            $roomId: roomId,
+        });
+        const data = {
+            user_id: userId,
+            reason: reason,
+        };
+        return this.http.authedRequest(
+            callback, "POST", path, undefined, data,
+        );
     }
 
     /**
@@ -5582,6 +5631,7 @@ export class MatrixClient extends EventEmitter {
     private startCallEventHandler = (): void => {
         if (this.isInitialSyncComplete()) {
             this.callEventHandler.start();
+            this.groupCallEventHandler.start();
             this.off("sync", this.startCallEventHandler);
         }
     };
