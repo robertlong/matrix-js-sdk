@@ -1,6 +1,6 @@
 {
   "name": "@robertlong/matrix-js-sdk",
-  "version": "12.5.0-dev8",
+  "version": "12.5.0-dev9",
   "description": "Matrix Client-Server SDK for Javascript",
   "scripts": {
     "prepublishOnly": "yarn build",
