@@ -420,8 +420,24 @@ export class MatrixCall extends EventEmitter {
         return this.localUsermediaFeed?.stream;
     }
 
-    private get localScreensharingStream(): MediaStream {
+    public get localScreensharingStream(): MediaStream {
         return this.localScreensharingFeed?.stream;
+    }
+
+    public get remoteUsermediaFeed(): CallFeed {
+        return this.getRemoteFeeds().find((feed) => feed.purpose === SDPStreamMetadataPurpose.Usermedia);
+    }
+
+    public get remoteScreensharingFeed(): CallFeed {
+        return this.getRemoteFeeds().find((feed) => feed.purpose === SDPStreamMetadataPurpose.Screenshare);
+    }
+
+    public get remoteUsermediaStream(): MediaStream {
+        return this.remoteUsermediaFeed?.stream;
+    }
+
+    public get remoteScreensharingStream(): MediaStream {
+        return this.remoteScreensharingFeed?.stream;
     }
 
     private getFeedByStreamId(streamId: string): CallFeed {
@@ -700,13 +716,34 @@ export class MatrixCall extends EventEmitter {
         this.setState(CallState.Ended);
     }
 
+    private shouldAnswerWithMediaType(
+        wantedValue: boolean | undefined, valueOfTheOtherSide: boolean | undefined, type: "audio" | "video",
+    ): boolean {
+        if (wantedValue && !valueOfTheOtherSide) {
+            // TODO: Figure out how to do this
+            logger.warn(`Unable to answer with ${type} because the other side isn't sending it either.`);
+            return false;
+        } else if (
+            !utils.isNullOrUndefined(wantedValue) &&
+            wantedValue !== valueOfTheOtherSide &&
+            !this.opponentSupportsSDPStreamMetadata()
+        ) {
+            logger.warn(
+                `Unable to answer with ${type}=${wantedValue} because the other side doesn't support it. ` +
+                `Answering with ${type}=${valueOfTheOtherSide}.`,
+            );
+            return valueOfTheOtherSide;
+        }
+        return wantedValue ?? valueOfTheOtherSide;
+    }
+
     /**
      * Answer a call.
      */
-    public async answer(): Promise<void> {
-        if (this.inviteOrAnswerSent) {
-            return;
-        }
+    public async answer(audio?: boolean, video?: boolean): Promise<void> {
+        if (this.inviteOrAnswerSent) return;
+        // TODO: Figure out how to do this
+        if (audio === false && video === false) throw new Error("You CANNOT answer a call without media");
 
         logger.debug(`Answering call ${this.callId}`);
 
@@ -716,8 +753,8 @@ export class MatrixCall extends EventEmitter {
 
             try {
                 const mediaStream = await this.client.getMediaHandler().getUserMediaStream(
-                    true,
-                    this.hasRemoteUserMediaVideoTrack,
+                    this.shouldAnswerWithMediaType(audio, this.hasRemoteUserMediaAudioTrack, "audio"),
+                    this.shouldAnswerWithMediaType(video, this.hasRemoteUserMediaVideoTrack, "video"),
                 );
                 this.waitForLocalAVStream = false;
                 this.gotUserMediaForAnswer(mediaStream);
@@ -986,6 +1023,7 @@ export class MatrixCall extends EventEmitter {
         }
         this.localUsermediaFeed?.setAudioMuted(muted);
         this.updateMuteStatus();
+        return this.isMicrophoneMuted();
     }
 
     /**
@@ -2038,7 +2076,7 @@ export class MatrixCall extends EventEmitter {
     }
 }
 
-function setTracksEnabled(tracks: Array<MediaStreamTrack>, enabled: boolean): void {
+export function setTracksEnabled(tracks: Array<MediaStreamTrack>, enabled: boolean): void {
     for (let i = 0; i < tracks.length; i++) {
         tracks[i].enabled = enabled;
     }
