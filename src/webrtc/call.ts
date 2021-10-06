@@ -517,7 +517,15 @@ export class MatrixCall extends EventEmitter {
         if (existingFeed) {
             existingFeed.setNewStream(stream);
         } else {
-            this.feeds.push(new CallFeed(stream, userId, purpose, this.client, this.roomId, audioMuted, videoMuted));
+            this.feeds.push(new CallFeed({
+                client: this.client,
+                roomId: this.roomId,
+                userId,
+                stream,
+                purpose,
+                audioMuted,
+                videoMuted,
+            }));
             this.emit(CallEvent.FeedsChanged, this.feeds);
         }
 
@@ -548,7 +556,15 @@ export class MatrixCall extends EventEmitter {
         if (feed) {
             feed.setNewStream(stream);
         } else {
-            this.feeds.push(new CallFeed(stream, userId, purpose, this.client, this.roomId, false, false));
+            this.feeds.push(new CallFeed({
+                client: this.client,
+                roomId: this.roomId,
+                audioMuted: false,
+                videoMuted: false,
+                userId,
+                stream,
+                purpose,
+            }));
             this.emit(CallEvent.FeedsChanged, this.feeds);
         }
 
@@ -563,7 +579,15 @@ export class MatrixCall extends EventEmitter {
         if (existingFeed) {
             existingFeed.setNewStream(stream);
         } else {
-            this.feeds.push(new CallFeed(stream, userId, purpose, this.client, this.roomId, false, false));
+            this.feeds.push(new CallFeed({
+                client: this.client,
+                roomId: this.roomId,
+                audioMuted: false,
+                videoMuted: false,
+                userId,
+                stream,
+                purpose,
+            }));
             this.emit(CallEvent.FeedsChanged, this.feeds);
         }
 
@@ -1018,7 +1042,7 @@ export class MatrixCall extends EventEmitter {
      */
     public async setMicrophoneMuted(muted: boolean): Promise<boolean> {
         if (!this.hasLocalUserMediaAudioTrack && !muted) {
-            await this.upgradeCall(false, true);
+            await this.upgradeCall(true, false);
             return this.isMicrophoneMuted();
         }
         this.localUsermediaFeed?.setAudioMuted(muted);
@@ -1597,10 +1621,13 @@ export class MatrixCall extends EventEmitter {
         if (this.peerConn.iceConnectionState == 'connected') {
             clearTimeout(this.iceDisconnectedTimeout);
             this.setState(CallState.Connected);
-            this.callLengthInterval = setInterval(() => {
-                this.callLength++;
-                this.emit(CallEvent.LengthChanged, this.callLength);
-            }, 1000);
+
+            if (!this.callLengthInterval) {
+                this.callLengthInterval = setInterval(() => {
+                    this.callLength++;
+                    this.emit(CallEvent.LengthChanged, this.callLength);
+                }, 1000);
+            }
         } else if (this.peerConn.iceConnectionState == 'failed') {
             this.hangup(CallErrorCode.IceFailed, false);
         } else if (this.peerConn.iceConnectionState == 'disconnected') {
