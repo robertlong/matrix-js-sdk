@@ -53,6 +53,7 @@ export class MediaHandler {
         const matchingStream = this.userMediaStreams.find((stream) => {
             if (audio !== (stream.getAudioTracks().length > 0)) return false;
             if (video !== (stream.getVideoTracks().length > 0)) return false;
+            return true;
         });
 
         if (matchingStream) {
@@ -89,7 +90,7 @@ export class MediaHandler {
     /**
      * @returns {MediaStream} based on passed parameters
      */
-    public async getScreensharingStream(desktopCapturerSourceId: string): Promise<MediaStream | null> {
+    public async getScreensharingStream(desktopCapturerSourceId?: string): Promise<MediaStream | null> {
         let stream: MediaStream;
 
         if (this.screensharingStreams.length === 0) {

@@ -23,7 +23,7 @@ import { EventEmitter } from "events";
 import { ISyncStateData, SyncApi } from "./sync";
 import { EventStatus, IContent, IDecryptOptions, IEvent, MatrixEvent } from "./models/event";
 import { StubStore } from "./store/stub";
-import { createNewMatrixCall, MatrixCall, CallType } from "./webrtc/call";
+import { createNewMatrixCall, MatrixCall } from "./webrtc/call";
 import { Filter, IFilterDefinition } from "./filter";
 import { CallEventHandler } from './webrtc/callEventHandler';
 import * as utils from './utils';
@@ -144,7 +144,12 @@ import { IHierarchyRoom, ISpaceSummaryEvent, ISpaceSummaryRoom } from "./@types/
 import { IPusher, IPusherRequest, IPushRules, PushRuleAction, PushRuleKind, RuleId } from "./@types/PushRules";
 import { IThreepid } from "./@types/threepids";
 import { CryptoStore } from "./crypto/store/base";
-import { CONF_ROOM, GroupCall, IGroupCallDataChannelOptions } from "./webrtc/groupCall";
+import {
+    GroupCall,
+    IGroupCallDataChannelOptions,
+    GroupCallIntent,
+    GroupCallType,
+} from "./webrtc/groupCall";
 import { MediaHandler } from "./webrtc/mediaHandler";
 import { GroupCallEventHandler } from "./webrtc/groupCallEventHandler";
 
@@ -1286,11 +1291,10 @@ export class MatrixClient extends EventEmitter {
      * The place*Call methods on the returned call can be used to actually place a call
      *
      * @param {string} roomId The room the call is to be placed in.
-     * @param {string} invitee The user to call in the given room.
      * @return {MatrixCall} the call or null if the browser doesn't support calling.
      */
-    public createCall(roomId: string, invitee?: string): MatrixCall {
-        return createNewMatrixCall(this, roomId, { invitee });
+    public createCall(roomId: string): MatrixCall {
+        return createNewMatrixCall(this, roomId);
     }
 
     /**
@@ -1302,7 +1306,8 @@ export class MatrixClient extends EventEmitter {
      */
     public async createGroupCall(
         roomId: string,
-        type: CallType,
+        type: GroupCallType,
+        intent: GroupCallIntent,
         dataChannelsEnabled?: boolean,
         dataChannelOptions?: IGroupCallDataChannelOptions,
     ): Promise<GroupCall> {
@@ -1316,23 +1321,14 @@ export class MatrixClient extends EventEmitter {
             throw new Error(`Cannot find room ${roomId}`);
         }
 
-        const groupCall = new GroupCall(this, room, type, dataChannelsEnabled, dataChannelOptions);
-        this.groupCallEventHandler.groupCalls.set(roomId, groupCall);
-
-        const activeConf = room.currentState
-            .getStateEvents(CONF_ROOM, "")
-            ?.getContent()?.active;
-
-        if (!activeConf) {
-            await this.sendStateEvent(
-                room.roomId,
-                CONF_ROOM,
-                { active: true, callType: type, dataChannelsEnabled, dataChannelOptions },
-                "",
-            );
-        }
-
-        return groupCall;
+        return new GroupCall(
+            this,
+            room,
+            type,
+            intent,
+            dataChannelsEnabled,
+            dataChannelOptions,
+        ).create();
     }
 
     /**
@@ -1341,32 +1337,7 @@ export class MatrixClient extends EventEmitter {
      * @returns {GroupCall} The group call or null if it doesn't already exist.
      */
     public getGroupCallForRoom(roomId: string): GroupCall | null {
-        const groupCall = this.groupCallEventHandler.groupCalls.get(roomId);
-
-        if (groupCall) {
-            return groupCall;
-        }
-
-        const room = this.getRoom(roomId);
-
-        if (!room) {
-            return null;
-        }
-
-        const stateEvents = room.currentState.getStateEvents(CONF_ROOM);
-
-        if (stateEvents.length === 0) {
-            return null;
-        }
-
-        const stateEvent = stateEvents[0];
-        const content = stateEvent.getContent();
-
-        if (content.active) {
-            return this.groupCallEventHandler.createGroupCallFromRoomStateEvent(stateEvent);
-        }
-
-        return null;
+        return this.groupCallEventHandler.groupCalls.get(roomId) || null;
     }
 
     /**

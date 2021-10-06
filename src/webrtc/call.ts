@@ -71,6 +71,8 @@ interface CallOpts {
     client?: any; // Fix when client is TSified
     forceTURN?: boolean;
     turnServers?: Array<TurnServer>;
+    useToDevice?: boolean;
+    groupCallId?: string;
 }
 
 interface TurnServer {
@@ -237,7 +239,7 @@ export class CallError extends Error {
     }
 }
 
-function genCallID(): string {
+export function genCallID(): string {
     return Date.now().toString() + randomString(16);
 }
 
@@ -312,6 +314,14 @@ export class MatrixCall extends EventEmitter {
     private callLengthInterval: number;
     private callLength = 0;
 
+    private useToDevice: boolean;
+    public groupCallId: string;
+
+    // Whether to stop local media when the call ends. We do not want to do this
+    // in group calls where the media is supplied by the group call. Doing this
+    // in a group call would result in breaking all the other calls
+    private stopLocalMediaOnEnd = true;
+
     constructor(opts: CallOpts) {
         super();
         this.roomId = opts.roomId;
@@ -319,6 +329,8 @@ export class MatrixCall extends EventEmitter {
         this.client = opts.client;
         this.forceTURN = opts.forceTURN;
         this.ourPartyId = this.client.deviceId;
+        this.useToDevice = opts.useToDevice;
+        this.groupCallId = opts.groupCallId;
         // Array of Objects with urls, username, credential keys
         this.turnServers = opts.turnServers || [];
         if (this.turnServers.length === 0 && this.client.isFallbackICEServerAllowed()) {
@@ -571,15 +583,19 @@ export class MatrixCall extends EventEmitter {
         logger.info(`Pushed remote stream (id="${stream.id}", active="${stream.active}")`);
     }
 
-    private pushLocalFeed(stream: MediaStream, purpose: SDPStreamMetadataPurpose, addToPeerConnection = true): void {
+    private pushNewLocalFeed(stream: MediaStream, purpose: SDPStreamMetadataPurpose, addToPeerConnection = true): void {
         const userId = this.client.getUserId();
+
+        // TODO: Find out what is going on here
+        // why do we enable audio (and only audio) tracks here? -- matthew
+        setTracksEnabled(stream.getAudioTracks(), true);
 
         // We try to replace an existing feed if there already is one with the same purpose
         const existingFeed = this.getLocalFeeds().find((feed) => feed.purpose === purpose);
         if (existingFeed) {
             existingFeed.setNewStream(stream);
         } else {
-            this.feeds.push(new CallFeed({
+            this.pushLocalFeed(new CallFeed({
                 client: this.client,
                 roomId: this.roomId,
                 audioMuted: false,
@@ -590,37 +606,68 @@ export class MatrixCall extends EventEmitter {
             }));
             this.emit(CallEvent.FeedsChanged, this.feeds);
         }
+    }
 
-        // TODO: Find out what is going on here
-        // why do we enable audio (and only audio) tracks here? -- matthew
-        setTracksEnabled(stream.getAudioTracks(), true);
+    /**
+     * Pushes supplied feed to the call
+     * @param {CallFeed} callFeed to push
+     * @param {boolean} addToPeerConnection whether to add the tracks to the peer connection
+     */
+    public pushLocalFeed(callFeed: CallFeed, addToPeerConnection = true): void {
+        this.feeds.push(callFeed);
 
         if (addToPeerConnection) {
-            const senderArray = purpose === SDPStreamMetadataPurpose.Usermedia ?
+            const senderArray = callFeed.purpose === SDPStreamMetadataPurpose.Usermedia ?
                 this.usermediaSenders : this.screensharingSenders;
             // Empty the array
             senderArray.splice(0, senderArray.length);
 
-            this.emit(CallEvent.FeedsChanged, this.feeds);
-            for (const track of stream.getTracks()) {
+            for (const track of callFeed.stream.getTracks()) {
                 logger.info(
                     `Adding track (` +
                     `id="${track.id}", ` +
                     `kind="${track.kind}", ` +
-                    `streamId="${stream.id}", ` +
-                    `streamPurpose="${purpose}"` +
+                    `streamId="${callFeed.stream}", ` +
+                    `streamPurpose="${callFeed.purpose}"` +
                     `) to peer connection`,
                 );
-                senderArray.push(this.peerConn.addTrack(track, stream));
+                senderArray.push(this.peerConn.addTrack(track, callFeed.stream));
             }
         }
 
-        logger.info(`Pushed local stream (id="${stream.id}", active="${stream.active}", purpose="${purpose}")`);
+        logger.info(
+            `Pushed local stream `+
+            `(id="${callFeed.stream.id}", `+
+            `active="${callFeed.stream.active}", `+
+            `purpose="${callFeed.purpose}")`,
+        );
+
+        this.emit(CallEvent.FeedsChanged, this.feeds);
+    }
+
+    /**
+     * Removes local call feed from the call and its tracks from the peer
+     * connection
+     * @param callFeed to remove
+     */
+    public removeLocalFeed(callFeed: CallFeed): void {
+        const senderArray = callFeed.purpose === SDPStreamMetadataPurpose.Usermedia
+            ? this.usermediaSenders
+            : this.screensharingSenders;
+
+        for (const sender of senderArray) {
+            this.peerConn.removeTrack(sender);
+        }
+        // Empty the array
+        senderArray.splice(0, senderArray.length);
+        this.deleteFeedByStream(callFeed.stream);
     }
 
     private deleteAllFeeds(): void {
         for (const feed of this.feeds) {
-            feed.dispose();
+            if (!feed.isLocal() || this.stopLocalMediaOnEnd) {
+                feed.dispose();
+            }
         }
 
         this.feeds = [];
@@ -769,19 +816,26 @@ export class MatrixCall extends EventEmitter {
         // TODO: Figure out how to do this
         if (audio === false && video === false) throw new Error("You CANNOT answer a call without media");
 
-        logger.debug(`Answering call ${this.callId}`);
-
         if (!this.localUsermediaStream && !this.waitForLocalAVStream) {
             this.setState(CallState.WaitLocalMedia);
             this.waitForLocalAVStream = true;
 
             try {
-                const mediaStream = await this.client.getMediaHandler().getUserMediaStream(
+                const stream = await this.client.getMediaHandler().getUserMediaStream(
                     this.shouldAnswerWithMediaType(audio, this.hasRemoteUserMediaAudioTrack, "audio"),
                     this.shouldAnswerWithMediaType(video, this.hasRemoteUserMediaVideoTrack, "video"),
                 );
                 this.waitForLocalAVStream = false;
-                this.gotUserMediaForAnswer(mediaStream);
+                const callFeed = new CallFeed({
+                    client: this.client,
+                    roomId: this.roomId,
+                    userId: this.client.getUserId(),
+                    stream,
+                    purpose: SDPStreamMetadataPurpose.Usermedia,
+                    audioMuted: false,
+                    videoMuted: false,
+                });
+                this.answerWithCallFeeds([callFeed], true);
             } catch (e) {
                 this.getUserMediaFailed(e);
                 return;
@@ -789,6 +843,16 @@ export class MatrixCall extends EventEmitter {
         } else if (this.waitForLocalAVStream) {
             this.setState(CallState.WaitLocalMedia);
         }
+    }
+
+    public answerWithCallFeeds(callFeeds: CallFeed[], stopLocalMediaOnEnd?: boolean): void {
+        if (this.inviteOrAnswerSent) return;
+
+        logger.debug(`Answering call ${this.callId}`);
+
+        this.stopLocalMediaOnEnd = stopLocalMediaOnEnd;
+
+        this.gotCallFeedsForAnswer(callFeeds);
     }
 
     /**
@@ -802,7 +866,7 @@ export class MatrixCall extends EventEmitter {
             newCall.waitForLocalAVStream = true;
         } else if ([CallState.CreateOffer, CallState.InviteSent].includes(this.state)) {
             logger.debug("Handing local stream to new call");
-            newCall.gotUserMediaForAnswer(this.localUsermediaStream);
+            newCall.gotCallFeedsForAnswer(this.getLocalFeeds());
         }
         this.successor = newCall;
         this.emit(CallEvent.Replaced, newCall);
@@ -874,7 +938,7 @@ export class MatrixCall extends EventEmitter {
                 if (this.hasLocalUserMediaAudioTrack) return;
                 if (this.hasLocalUserMediaVideoTrack) return;
 
-                this.pushLocalFeed(stream, SDPStreamMetadataPurpose.Usermedia);
+                this.pushNewLocalFeed(stream, SDPStreamMetadataPurpose.Usermedia);
             } else if (upgradeAudio) {
                 if (this.hasLocalUserMediaAudioTrack) return;
 
@@ -940,7 +1004,7 @@ export class MatrixCall extends EventEmitter {
             try {
                 const stream = await this.client.getMediaHandler().getScreensharingStream(desktopCapturerSourceId);
                 if (!stream) return false;
-                this.pushLocalFeed(stream, SDPStreamMetadataPurpose.Screenshare);
+                this.pushNewLocalFeed(stream, SDPStreamMetadataPurpose.Screenshare);
                 return true;
             } catch (err) {
                 this.emit(CallEvent.Error,
@@ -982,7 +1046,7 @@ export class MatrixCall extends EventEmitter {
                 });
                 sender.replaceTrack(track);
 
-                this.pushLocalFeed(stream, SDPStreamMetadataPurpose.Screenshare, false);
+                this.pushNewLocalFeed(stream, SDPStreamMetadataPurpose.Screenshare, false);
 
                 return true;
             } catch (err) {
@@ -1134,13 +1198,9 @@ export class MatrixCall extends EventEmitter {
         setTracksEnabled(this.localUsermediaStream.getVideoTracks(), !vidShouldBeMuted);
     }
 
-    /**
-     * Internal
-     * @param {Object} stream
-     */
-    private gotUserMediaForInvite = async (stream: MediaStream): Promise<void> => {
+    private gotCallFeedsForInvite(callFeeds: CallFeed[]): void {
         if (this.successor) {
-            this.successor.gotUserMediaForAnswer(stream);
+            this.successor.gotCallFeedsForAnswer(callFeeds);
             return;
         }
         if (this.callHasEnded()) {
@@ -1148,12 +1208,14 @@ export class MatrixCall extends EventEmitter {
             return;
         }
 
-        this.pushLocalFeed(stream, SDPStreamMetadataPurpose.Usermedia);
+        for (const feed of callFeeds) {
+            this.pushLocalFeed(feed);
+        }
         this.setState(CallState.CreateOffer);
 
         logger.debug("gotUserMediaForInvite");
         // Now we wait for the negotiationneeded event
-    };
+    }
 
     private async sendAnswer(): Promise<void> {
         const answerContent = {
@@ -1202,12 +1264,15 @@ export class MatrixCall extends EventEmitter {
         this.sendCandidateQueue();
     }
 
-    private gotUserMediaForAnswer = async (stream: MediaStream): Promise<void> => {
-        if (this.callHasEnded()) {
-            return;
+    private async gotCallFeedsForAnswer(callFeeds: CallFeed[]): Promise<void> {
+        if (this.callHasEnded()) return;
+
+        this.waitForLocalAVStream = false;
+
+        for (const feed of callFeeds) {
+            this.pushLocalFeed(feed);
         }
 
-        this.pushLocalFeed(stream, SDPStreamMetadataPurpose.Usermedia);
         this.setState(CallState.CreateAnswer);
 
         let myAnswer;
@@ -1235,7 +1300,7 @@ export class MatrixCall extends EventEmitter {
             this.terminate(CallParty.Local, CallErrorCode.SetLocalDescription, true);
             return;
         }
-    };
+    }
 
     /**
      * Internal
@@ -1773,12 +1838,23 @@ export class MatrixCall extends EventEmitter {
      * @param {Object} content
      * @return {Promise}
      */
-    private sendVoipEvent(eventType: string, content: object): Promise<ISendEventResponse> {
-        return this.client.sendEvent(this.roomId, eventType, Object.assign({}, content, {
+    private sendVoipEvent(eventType: string, content: object): Promise<ISendEventResponse | {}> {
+        const realContent = Object.assign({}, content, {
             version: VOIP_PROTO_VERSION,
             call_id: this.callId,
             party_id: this.ourPartyId,
-        }));
+            conf_id: this.groupCallId,
+        });
+
+        if (this.useToDevice) {
+            return this.client.sendToDevice(eventType, {
+                [this.invitee || this.getOpponentMember().userId]: {
+                    "*": realContent,
+                },
+            });
+        } else {
+            return this.client.sendEvent(this.roomId, eventType, realContent);
+        }
     }
 
     private queueCandidate(content: RTCIceCandidate): void {
@@ -1908,14 +1984,22 @@ export class MatrixCall extends EventEmitter {
     }
 
     private stopAllMedia(): void {
-        logger.debug(`stopAllMedia (stream=${this.localUsermediaStream})`);
+        logger.debug(this.stopLocalMediaOnEnd ? "Stopping all media" : "Stopping all media except local feeds" );
 
         for (const feed of this.feeds) {
-            if (feed.isLocal() && feed.purpose === SDPStreamMetadataPurpose.Usermedia) {
+            if (
+                feed.isLocal() &&
+                feed.purpose === SDPStreamMetadataPurpose.Usermedia &&
+                this.stopLocalMediaOnEnd
+            ) {
                 this.client.getMediaHandler().stopUserMediaStream(feed.stream);
-            } else if (feed.isLocal() && feed.purpose === SDPStreamMetadataPurpose.Screenshare) {
+            } else if (
+                feed.isLocal() &&
+                feed.purpose === SDPStreamMetadataPurpose.Screenshare &&
+                this.stopLocalMediaOnEnd
+            ) {
                 this.client.getMediaHandler().stopScreensharingStream(feed.stream);
-            } else {
+            } else if (!feed.isLocal() || this.stopLocalMediaOnEnd) {
                 for (const track of feed.stream.getTracks()) {
                     track.stop();
                 }
@@ -1986,15 +2070,42 @@ export class MatrixCall extends EventEmitter {
      * @throws if have passed audio=false.
      */
     public async placeCall(audio: boolean, video: boolean): Promise<void> {
-        logger.debug(`placeCall audio=${audio} video=${video}`);
         if (!audio) {
             throw new Error("You CANNOT start a call without audio");
         }
+        this.setState(CallState.WaitLocalMedia);
+
+        try {
+            const stream = await this.client.getMediaHandler().getUserMediaStream(audio, video);
+            const callFeed = new CallFeed({
+                client: this.client,
+                roomId: this.roomId,
+                userId: this.client.getUserId(),
+                stream,
+                purpose: SDPStreamMetadataPurpose.Usermedia,
+                audioMuted: false,
+                videoMuted: false,
+            });
+            await this.placeCallWithCallFeeds([callFeed], true);
+        } catch (e) {
+            this.getUserMediaFailed(e);
+            return;
+        }
+    }
+
+    /**
+     * Place a call to this room with call feed.
+     * @param {CallFeed[]} callFeeds to use
+     * @throws if you have not specified a listener for 'error' events.
+     * @throws if have passed audio=false.
+     */
+    public async placeCallWithCallFeeds(callFeeds: CallFeed[], stopLocalMediaOnEnd?: boolean): Promise<void> {
         this.checkForErrorListener();
+        this.stopLocalMediaOnEnd = stopLocalMediaOnEnd;
+        this.direction = CallDirection.Outbound;
+
         // XXX Find a better way to do this
         this.client.callEventHandler.calls.set(this.callId, this);
-        this.setState(CallState.WaitLocalMedia);
-        this.direction = CallDirection.Outbound;
 
         // make sure we have valid turn creds. Unless something's gone wrong, it should
         // poll and keep the credentials valid so this should be instant.
@@ -2006,14 +2117,7 @@ export class MatrixCall extends EventEmitter {
         // create the peer connection now so it can be gathering candidates while we get user
         // media (assuming a candidate pool size is configured)
         this.peerConn = this.createPeerConnection();
-
-        try {
-            const mediaStream = await this.client.getMediaHandler().getUserMediaStream(audio, video);
-            this.gotUserMediaForInvite(mediaStream);
-        } catch (e) {
-            this.getUserMediaFailed(e);
-            return;
-        }
+        this.gotCallFeedsForInvite(callFeeds);
     }
 
     private createPeerConnection(): RTCPeerConnection {
@@ -2064,7 +2168,7 @@ export class MatrixCall extends EventEmitter {
             this.opponentPartyId = msg.party_id || null;
         }
         this.opponentCaps = msg.capabilities || {} as CallCapabilities;
-        this.opponentMember = ev.sender;
+        this.opponentMember = this.client.getRoom(this.roomId).getMember(ev.getSender());
     }
 
     private async addBufferedIceCandidates(): Promise<void> {
@@ -2153,13 +2257,15 @@ export function createNewMatrixCall(client: any, roomId: string, options?: CallO
 
     const optionsForceTURN = options ? options.forceTURN : false;
 
-    const opts = {
+    const opts: CallOpts = {
         client: client,
         roomId: roomId,
-        invitee: options && options.invitee,
+        invitee: options?.invitee,
         turnServers: client.getTurnServers(),
         // call level options
         forceTURN: client.forceTURN || optionsForceTURN,
+        useToDevice: options?.useToDevice,
+        groupCallId: options?.groupCallId,
     };
     const call = new MatrixCall(opts);
 
